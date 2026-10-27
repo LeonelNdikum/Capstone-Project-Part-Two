@@ -5,7 +5,7 @@ variable "aws_region" {
 }
 
 variable "repository_name" {
-  description = "ECR repository name"
+  description = "ECR automation"
   type        = string
   default     = "capstone-image"
 }
