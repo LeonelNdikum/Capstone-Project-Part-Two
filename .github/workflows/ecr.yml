@@ -1,0 +1,93 @@
+name: Build and publish to ECR
+
+on:
+  pull_request:
+    branches: [dev, staging, main]
+  push:
+    branches: [dev, staging, main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        required: true
+        options: [dev, staging, prod]
+
+permissions:
+  contents: read
+
+jobs:
+  build-pr:
+    name: Validate ${{ matrix.environment }} image
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - branch: dev
+            environment: dev
+          - branch: staging
+            environment: staging
+          - branch: main
+            environment: prod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (no push for pull requests)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: capstone:${{ matrix.environment }}-pr
+          build-args: |
+            APP_ENV=${{ matrix.environment }}
+            VCS_REF=${{ github.event.pull_request.head.sha }}
+            VCS_URL=${{ github.server_url }}/${{ github.repository }}
+
+  publish:
+    name: Publish image
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || (github.ref_name == 'main' && 'prod' || github.ref_name) }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Set target environment
+        id: target
+        shell: bash
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "name=$DISPATCH_ENV" >> "$GITHUB_OUTPUT"
+          elif [[ "$BRANCH" == "main" ]]; then
+            echo "name=prod" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_ENV: ${{ inputs.environment }}
+          BRANCH: ${{ github.ref_name }}
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Configure AWS credentials with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push environment tags
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ steps.target.outputs.name }}-${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ steps.target.outputs.name }}-latest
+          build-args: |
+            APP_ENV=${{ steps.target.outputs.name }}
+            VCS_REF=${{ github.sha }}
+            VCS_URL=${{ github.server_url }}/${{ github.repository }}

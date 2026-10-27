@@ -1,0 +1,73 @@
+name: Destroy environment images in ECR
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment whose images should be deleted
+        type: choice
+        required: true
+        options: [dev, staging, prod]
+      confirm_environment:
+        description: Type the selected environment again
+        type: string
+        required: true
+      confirmation:
+        description: Type DELETE to confirm removal of that environment's images
+        type: string
+        required: true
+
+permissions:
+  id-token: write
+
+jobs:
+  destroy:
+    if: inputs.environment == inputs.confirm_environment && inputs.confirmation == 'DELETE'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Validate environment configuration
+        shell: bash
+        env:
+          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+          CONFIGURED_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          CONFIGURED_REGION: ${{ vars.AWS_REGION }}
+          CONFIGURED_ROLE: ${{ vars.AWS_ROLE_TO_ASSUME }}
+        run: |
+          if [[ ! "$TARGET_ENVIRONMENT" =~ ^(dev|staging|prod)$ ]]; then
+            echo "Unsupported environment." >&2
+            exit 1
+          fi
+          if [[ -z "$CONFIGURED_REPOSITORY" || -z "$CONFIGURED_REGION" || -z "$CONFIGURED_ROLE" ]]; then
+            echo "Set ECR_REPOSITORY, AWS_REGION, and AWS_ROLE_TO_ASSUME for the selected GitHub environment." >&2
+            exit 1
+          fi
+      - name: Configure AWS credentials with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Delete only selected environment tags
+        shell: bash
+        env:
+          REPOSITORY_NAME: ${{ vars.ECR_REPOSITORY }}
+          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          image_ids=$(aws ecr list-images \
+            --repository-name "$REPOSITORY_NAME" \
+            --filter tagStatus=TAGGED \
+            --query "imageIds[?starts_with(imageTag, '${TARGET_ENVIRONMENT}-')]" \
+            --output json)
+          count=$(jq 'length' <<< "$image_ids")
+          if (( count == 0 )); then
+            echo "No tagged images found for $TARGET_ENVIRONMENT in $REPOSITORY_NAME."
+            exit 0
+          fi
+          echo "Deleting $count tag(s) for $TARGET_ENVIRONMENT from $REPOSITORY_NAME."
+          for ((offset = 0; offset < count; offset += 100)); do
+            batch=$(jq -c ".[${offset}:(${offset}+100)]" <<< "$image_ids")
+            aws ecr batch-delete-image \
+              --repository-name "$REPOSITORY_NAME" \
+              --image-ids "$batch"
+          done
